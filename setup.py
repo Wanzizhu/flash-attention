@@ -24,11 +24,11 @@ from torch.utils.cpp_extension import (
     BuildExtension,
     CppExtension,
     CUDAExtension,
+    SyclExtension,
     CUDA_HOME,
     ROCM_HOME,
     IS_HIP_EXTENSION,
 )
-
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -42,19 +42,21 @@ BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 if BUILD_TARGET == "auto":
     if IS_HIP_EXTENSION:
         IS_ROCM = True
+    elif CUDA_HOME is not None:
+        IS_CUDA = True
     else:
-        IS_ROCM = False
+        IS_XPU = True
 else:
     if BUILD_TARGET == "cuda":
-        IS_ROCM = False
+        IS_CUDA = True
     elif BUILD_TARGET == "rocm":
         IS_ROCM = True
+    elif BUILD_TARGET == "xpu":
+        IS_XPU = True
 
 PACKAGE_NAME = "flash_attn"
 
-BASE_WHEEL_URL = (
-    "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
-)
+BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
 
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
@@ -75,7 +77,7 @@ def get_platform():
     Returns the platform name as used in wheel filenames.
     """
     if sys.platform.startswith("linux"):
-        return f'linux_{platform.uname().machine}'
+        return f"linux_{platform.uname().machine}"
     elif sys.platform == "darwin":
         mac_version = ".".join(platform.mac_ver()[0].split(".")[:2])
         return f"macosx_{mac_version}_x86_64"
@@ -86,7 +88,9 @@ def get_platform():
 
 
 def get_cuda_bare_metal_version(cuda_dir):
-    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
+    raw_output = subprocess.check_output(
+        [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
+    )
     output = raw_output.split()
     release_idx = output.index("release") + 1
     bare_metal_version = parse(output[release_idx].split(",")[0])
@@ -95,7 +99,7 @@ def get_cuda_bare_metal_version(cuda_dir):
 
 
 def get_hip_version():
-    return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
+    return parse(torch.version.hip.split()[-1].rstrip("-").replace("-", "+"))
 
 
 def check_if_cuda_home_none(global_option: str) -> None:
@@ -115,9 +119,7 @@ def check_if_rocm_home_none(global_option: str) -> None:
         return
     # warn instead of error because user could be downloading prebuilt wheels, so hipcc won't be necessary
     # in that case.
-    warnings.warn(
-        f"{global_option} was requested, but hipcc was not found."
-    )
+    warnings.warn(f"{global_option} was requested, but hipcc was not found.")
 
 
 def append_nvcc_threads(nvcc_extra_args):
@@ -146,20 +148,22 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if os.path.isdir(".git"):
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
+    subprocess.run(
+        ["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True
+    )
     subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
 else:
     if IS_ROCM:
         if not USE_TRITON_ROCM:
-            assert (
-                os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py")
+            assert os.path.exists(
+                "csrc/composable_kernel/example/ck_tile/01_fmha/generate.py"
             ), "csrc/composable_kernel is missing, please use source distribution or git clone"
-    else:
-        assert (
-            os.path.exists("csrc/cutlass/include/cutlass/cutlass.h")
+    elif IS_CUDA:
+        assert os.path.exists(
+            "csrc/cutlass/include/cutlass/cutlass.h"
         ), "csrc/cutlass is missing, please use source distribution or git clone"
 
-if not SKIP_CUDA_BUILD and not IS_ROCM:
+if not SKIP_CUDA_BUILD and IS_CUDA:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
@@ -328,20 +332,70 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     else:
         ck_dir = "csrc/composable_kernel"
 
-        #use codegen get code dispatch
+        # use codegen get code dispatch
         if not os.path.exists("./build"):
             os.makedirs("build")
 
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2"], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2"], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2"], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2"], check=True)
+        subprocess.run(
+            [
+                sys.executable,
+                f"{ck_dir}/example/ck_tile/01_fmha/generate.py",
+                "-d",
+                "fwd",
+                "--output_dir",
+                "build",
+                "--receipt",
+                "2",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                f"{ck_dir}/example/ck_tile/01_fmha/generate.py",
+                "-d",
+                "fwd_appendkv",
+                "--output_dir",
+                "build",
+                "--receipt",
+                "2",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                f"{ck_dir}/example/ck_tile/01_fmha/generate.py",
+                "-d",
+                "fwd_splitkv",
+                "--output_dir",
+                "build",
+                "--receipt",
+                "2",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                f"{ck_dir}/example/ck_tile/01_fmha/generate.py",
+                "-d",
+                "bwd",
+                "--output_dir",
+                "build",
+                "--receipt",
+                "2",
+            ],
+            check=True,
+        )
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
         generator_flag = []
         torch_dir = torch.__path__[0]
-        if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
+        if os.path.exists(
+            os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")
+        ):
             generator_flag = ["-DOLD_GENERATOR_PATH"]
 
         check_if_rocm_home_none("flash_attn")
@@ -356,53 +410,64 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if FORCE_CXX11_ABI:
             torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-        sources = ["csrc/flash_attn_ck/flash_api.cpp",
-                "csrc/flash_attn_ck/flash_common.cpp",
-                "csrc/flash_attn_ck/mha_bwd.cpp",
-                "csrc/flash_attn_ck/mha_fwd_kvcache.cpp",
-                "csrc/flash_attn_ck/mha_fwd.cpp",
-                "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
-                "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
-            f"build/fmha_*wd*.cpp"
-        )
+        sources = [
+            "csrc/flash_attn_ck/flash_api.cpp",
+            "csrc/flash_attn_ck/flash_common.cpp",
+            "csrc/flash_attn_ck/mha_bwd.cpp",
+            "csrc/flash_attn_ck/mha_fwd_kvcache.cpp",
+            "csrc/flash_attn_ck/mha_fwd.cpp",
+            "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
+            "csrc/flash_attn_ck/mha_varlen_fwd.cpp",
+        ] + glob.glob(f"build/fmha_*wd*.cpp")
 
         rename_cpp_to_cu(sources)
 
-        renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
-                        "csrc/flash_attn_ck/flash_common.cu",
-                        "csrc/flash_attn_ck/mha_bwd.cu",
-                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
-                        "csrc/flash_attn_ck/mha_fwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+        renamed_sources = [
+            "csrc/flash_attn_ck/flash_api.cu",
+            "csrc/flash_attn_ck/flash_common.cu",
+            "csrc/flash_attn_ck/mha_bwd.cu",
+            "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
+            "csrc/flash_attn_ck/mha_fwd.cu",
+            "csrc/flash_attn_ck/mha_varlen_bwd.cu",
+            "csrc/flash_attn_ck/mha_varlen_fwd.cu",
+        ] + glob.glob(f"build/fmha_*wd*.cu")
 
-        cc_flag += ["-O3","-std=c++17",
-                    "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
-                    "-fgpu-flush-denormals-to-zero",
-                    "-DCK_ENABLE_BF16",
-                    "-DCK_ENABLE_BF8",
-                    "-DCK_ENABLE_FP16",
-                    "-DCK_ENABLE_FP32",
-                    "-DCK_ENABLE_FP64",
-                    "-DCK_ENABLE_FP8",
-                    "-DCK_ENABLE_INT8",
-                    "-DCK_USE_XDL",
-                    "-DUSE_PROF_API=1",
-                    # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                    "-D__HIP_PLATFORM_HCC__=1"]
+        cc_flag += [
+            "-O3",
+            "-std=c++17",
+            "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
+            "-fgpu-flush-denormals-to-zero",
+            "-DCK_ENABLE_BF16",
+            "-DCK_ENABLE_BF8",
+            "-DCK_ENABLE_FP16",
+            "-DCK_ENABLE_FP32",
+            "-DCK_ENABLE_FP64",
+            "-DCK_ENABLE_FP8",
+            "-DCK_ENABLE_INT8",
+            "-DCK_USE_XDL",
+            "-DUSE_PROF_API=1",
+            # "-DFLASHATTENTION_DISABLE_BACKWARD",
+            "-D__HIP_PLATFORM_HCC__=1",
+        ]
 
-        cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]
+        cc_flag += [
+            f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"
+        ]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
-        if hip_version > Version('5.7.23302'):
+        if hip_version > Version("5.7.23302"):
             cc_flag += ["-fno-offload-uniform-block"]
-        if hip_version > Version('6.1.40090'):
+        if hip_version > Version("6.1.40090"):
             cc_flag += ["-mllvm", "-enable-post-misched=0"]
-        if hip_version > Version('6.2.41132'):
-            cc_flag += ["-mllvm", "-amdgpu-early-inline-all=true",
-                        "-mllvm", "-amdgpu-function-calls=false"]
-        if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+        if hip_version > Version("6.2.41132"):
+            cc_flag += [
+                "-mllvm",
+                "-amdgpu-early-inline-all=true",
+                "-mllvm",
+                "-amdgpu-function-calls=false",
+            ]
+        if hip_version > Version("6.2.41133") and hip_version < Version("6.3.00000"):
             cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
         extra_compile_args = {
@@ -413,7 +478,12 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         include_dirs = [
             Path(this_dir) / "csrc" / "composable_kernel" / "include",
             Path(this_dir) / "csrc" / "composable_kernel" / "library" / "include",
-            Path(this_dir) / "csrc" / "composable_kernel" / "example" / "ck_tile" / "01_fmha",
+            Path(this_dir)
+            / "csrc"
+            / "composable_kernel"
+            / "example"
+            / "ck_tile"
+            / "01_fmha",
         ]
 
         ext_modules.append(
@@ -424,6 +494,37 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                 include_dirs=include_dirs,
             )
         )
+else:
+    print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
+    TORCH_MAJOR = int(torch.__version__.split(".")[0])
+    TORCH_MINOR = int(torch.__version__.split(".")[1])
+    if FORCE_CXX11_ABI:
+        torch._C._GLIBCXX_USE_CXX11_ABI = True
+    ext_modules.append(
+        SyclExtension(
+            name="flash_attn_sycl",
+            sources=["csrc/flash_attn_sycl/flash_api.cpp"],
+            extra_compile_args={
+                "cxx": [
+                    "-std=c++20",
+                    "-fsycl-targets=spir64_gen",
+                    "-ffast-math",
+                    "-Wall",
+                    "-Wno-deprecated-declarations",
+                    "-Wno-unused-variable",
+                    "-Wno-vla-cxx-extension",
+                ]
+            },
+            extra_link_args=[
+                "-fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen",
+                "-device pvc -internal_options -cl-intel-256-GRF-per-thread",
+                "-fsycl-max-parallel-link-jobs=8",
+            ],
+            include_dirs=[
+                Path(this_dir) / "csrc" / "sytla_kernel" / "include",
+            ],
+        )
+    )
 
 
 def get_package_version():
@@ -449,21 +550,29 @@ def get_wheel_url():
         torch_hip_version = get_hip_version()
         hip_version = f"{torch_hip_version.major}{torch_hip_version.minor}"
         wheel_filename = f"{PACKAGE_NAME}-{flash_version}+rocm{hip_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
-    else:
+    elif IS_CUDA:
         # Determine the version numbers that will be used to determine the correct wheel
         # We're using the CUDA version used to build torch, not the one currently installed
         # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
         torch_cuda_version = parse(torch.version.cuda)
         # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.3
         # to save CI time. Minor versions should be compatible.
-        torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.3")
+        torch_cuda_version = (
+            parse("11.8") if torch_cuda_version.major == 11 else parse("12.3")
+        )
         # cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
         cuda_version = f"{torch_cuda_version.major}"
 
         # Determine wheel URL based on CUDA version, torch version, python version and OS
         wheel_filename = f"{PACKAGE_NAME}-{flash_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
-
-    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{flash_version}", wheel_name=wheel_filename)
+    else:
+        torch_xpu_version = parse(torch.version.xpu)
+        xpu_version = f"{torch_xpu_version.major}"
+        wheel_filename = f"{PACKAGE_NAME}-{flash_version}+sycl{xpu_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
+    
+    wheel_url = BASE_WHEEL_URL.format(
+        tag_name=f"v{flash_version}", wheel_name=wheel_filename
+    )
 
     return wheel_url, wheel_filename
 
@@ -513,8 +622,12 @@ class NinjaBuildExtension(BuildExtension):
             max_num_jobs_cores = max(1, os.cpu_count() // 2)
 
             # calculate the maximum allowed NUM_JOBS based on free memory
-            free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
-            max_num_jobs_memory = int(free_memory_gb / 9)  # each JOB peak memory cost is ~8-9GB when threads = 4
+            free_memory_gb = psutil.virtual_memory().available / (
+                1024**3
+            )  # free memory in GB
+            max_num_jobs_memory = int(
+                free_memory_gb / 9
+            )  # each JOB peak memory cost is ~8-9GB when threads = 4
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
             max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
@@ -550,11 +663,13 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
-    if ext_modules
-    else {
-        "bdist_wheel": CachedWheelsCommand,
-    },
+    cmdclass=(
+        {"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
+        if ext_modules
+        else {
+            "bdist_wheel": CachedWheelsCommand,
+        }
+    ),
     python_requires=">=3.9",
     install_requires=[
         "torch",
